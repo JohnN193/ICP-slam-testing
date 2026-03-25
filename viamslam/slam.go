@@ -1,4 +1,5 @@
-// Package viamslam implements a Viam SLAM service that exposes an ICP-merged point cloud map.
+// Package viamslam implements a Viam SLAM service that builds a point cloud map
+// by accumulating scans from a camera and aligning them with ICP.
 package viamslam
 
 import (
@@ -7,14 +8,24 @@ import (
 	"io"
 	"sync"
 
+	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
+	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
+	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/services/slam"
 	"go.viam.com/rdk/spatialmath"
+
+	icp "github.com/viamrobotics/icp"
 )
 
-const chunkSizeBytes = 1 * 1024 * 1024 // 1MB
+const (
+	chunkSizeBytes = 1 * 1024 * 1024 // 1MB
+
+	// DoCommand key for adding a new scan to the map.
+	addScanKey = "add_scan"
+)
 
 // Model is the resource model triplet for this SLAM service.
 var Model = resource.NewModel("viam-labs", "icp", "icp-slam")
@@ -23,51 +34,136 @@ func init() {
 	resource.RegisterService(
 		slam.API,
 		Model,
-		resource.Registration[slam.Service, resource.NoNativeConfig]{
+		resource.Registration[slam.Service, *Config]{
 			Constructor: newICPSlam,
 		},
 	)
 }
 
-// ICPSlam is a SLAM service that serves a pre-built ICP point cloud map.
+// Config holds the names of the camera and optional movement sensor to use.
+type Config struct {
+	Camera         string `json:"camera"`
+	MovementSensor string `json:"movement_sensor,omitempty"`
+}
+
+// Validate returns the list of dependencies this service requires.
+func (c *Config) Validate(path string) ([]string, []string, error) {
+	if c.Camera == "" {
+		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "camera")
+	}
+	deps := []string{
+		c.Camera,
+		framesystem.PublicServiceName.String(),
+	}
+	if c.MovementSensor != "" {
+		deps = append(deps, c.MovementSensor)
+	}
+	return deps, nil, nil
+}
+
+// ICPSlam is a SLAM service that accumulates scans and aligns them with ICP.
 type ICPSlam struct {
 	resource.Named
 	resource.AlwaysRebuild
 
-	mu     sync.RWMutex
-	cloud  pointcloud.PointCloud
-	logger logging.Logger
+	mu       sync.RWMutex
+	clouds   []pointcloud.PointCloud // accumulated world-frame scans
+	mergedPC pointcloud.PointCloud   // latest ICP-aligned map
+
+	camera    camera.Camera
+	fsService framesystem.Service
+	icpConfig icp.ICPConfig
+	logger    logging.Logger
 }
 
 func newICPSlam(
 	_ context.Context,
-	_ resource.Dependencies,
+	deps resource.Dependencies,
 	conf resource.Config,
 	logger logging.Logger,
 ) (slam.Service, error) {
+	cfg, err := resource.NativeConfig[*Config](conf)
+	if err != nil {
+		return nil, err
+	}
+
+	cam, err := camera.FromDependencies(deps, cfg.Camera)
+	if err != nil {
+		return nil, err
+	}
+
+	fs, err := framesystem.FromDependencies(deps)
+	if err != nil {
+		return nil, err
+	}
+
 	return &ICPSlam{
-		Named:  conf.ResourceName().AsNamed(),
-		logger: logger,
+		Named:     conf.ResourceName().AsNamed(),
+		camera:    cam,
+		fsService: fs,
+		icpConfig: icp.DefaultICPConfig(),
+		logger:    logger,
 	}, nil
 }
 
-// SetPointCloud updates the point cloud map stored in this service.
-func (s *ICPSlam) SetPointCloud(cloud pointcloud.PointCloud) {
+// DoCommand handles the "add_scan" command, which pulls the current point cloud
+// from the camera, transforms it into the world frame via the frame system,
+// adds it to the accumulated scans, and re-runs ICP alignment.
+func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	if _, ok := cmd[addScanKey]; !ok {
+		return map[string]interface{}{}, nil
+	}
+
+	// Pull the current scan from the camera (in camera frame).
+	pc, err := s.camera.NextPointCloud(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Transform the scan from camera frame into world frame using the frame system.
+	// The frame system uses the robot's configured transforms (including any odometry
+	// supplemental transforms if the robot is set up with a movement sensor).
+	cameraFrame := s.camera.Name().ShortName()
+	worldPC, err := s.fsService.TransformPointCloud(ctx, pc, cameraFrame, referenceframe.World)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cloud = cloud
+	s.clouds = append(s.clouds, worldPC)
+	clouds := make([]pointcloud.PointCloud, len(s.clouds))
+	copy(clouds, s.clouds)
+	s.mu.Unlock()
+
+	// Run ICP alignment once we have at least two scans.
+	if len(clouds) >= 2 {
+		merged, err := icp.AlignPointClouds(ctx, clouds, s.icpConfig, s.logger)
+		if err != nil {
+			return nil, err
+		}
+		s.mu.Lock()
+		s.mergedPC = merged
+		s.mu.Unlock()
+	}
+
+	s.mu.RLock()
+	size := 0
+	if s.mergedPC != nil {
+		size = s.mergedPC.Size()
+	}
+	s.mu.RUnlock()
+
+	return map[string]interface{}{
+		"scans_accumulated": len(clouds),
+		"map_points":        size,
+	}, nil
 }
 
-// Position returns a zero pose — no localization is implemented.
-func (s *ICPSlam) Position(_ context.Context) (spatialmath.Pose, error) {
-	return spatialmath.NewZeroPose(), nil
-}
-
-// PointCloudMap serializes the stored point cloud to PCD binary format and returns it as
-// a streaming callback that yields 1MB chunks until io.EOF.
+// PointCloudMap serializes the current merged map to PCD binary format and returns
+// it as a streaming callback that yields 1MB chunks until io.EOF.
 func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, error), error) {
 	s.mu.RLock()
-	cloud := s.cloud
+	cloud := s.mergedPC
 	s.mu.RUnlock()
 
 	var buf bytes.Buffer
@@ -87,26 +183,28 @@ func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, erro
 	}, nil
 }
 
-// InternalState returns an empty stream — no internal algorithm state to expose.
+// Position returns a zero pose — localization is not implemented.
+func (s *ICPSlam) Position(_ context.Context) (spatialmath.Pose, error) {
+	return spatialmath.NewZeroPose(), nil
+}
+
+// InternalState returns an empty stream.
 func (s *ICPSlam) InternalState(_ context.Context) (func() ([]byte, error), error) {
 	return func() ([]byte, error) {
 		return nil, io.EOF
 	}, nil
 }
 
-// Properties returns the properties of this SLAM service.
+// Properties describes the capabilities of this SLAM service.
 func (s *ICPSlam) Properties(_ context.Context) (slam.Properties, error) {
 	return slam.Properties{
 		CloudSlam:             false,
-		MappingMode:           slam.MappingModeLocalizationOnly,
+		MappingMode:           slam.MappingModeNewMap,
 		InternalStateFileType: "",
-		SensorInfo:            []slam.SensorInfo{},
+		SensorInfo: []slam.SensorInfo{
+			{Name: s.camera.Name().ShortName(), Type: slam.SensorTypeCamera},
+		},
 	}, nil
-}
-
-// DoCommand is a no-op for now.
-func (s *ICPSlam) DoCommand(_ context.Context, _ map[string]interface{}) (map[string]interface{}, error) {
-	return map[string]interface{}{}, nil
 }
 
 // Close is a no-op.
