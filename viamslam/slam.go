@@ -22,16 +22,16 @@ import (
 )
 
 const (
-	chunkSizeBytes  = 1 * 1024 * 1024 // 1MB
-	metersToMM      = 1000.0
-	mmToMeters      = 1.0 / metersToMM
+	chunkSizeBytes = 1 * 1024 * 1024 // 1MB
+	metersToMM     = 1000.0
+	mmToMeters     = 1.0 / metersToMM
 
 	// DoCommand key for adding a new scan to the map.
 	addScanKey = "add_scan"
 )
 
 // Model is the resource model triplet for this SLAM service.
-var Model = resource.NewModel("viam-labs", "icp", "icp-slam")
+var Model = resource.NewModel("cjnj193", "icp", "icp-slam")
 
 func init() {
 	resource.RegisterService(

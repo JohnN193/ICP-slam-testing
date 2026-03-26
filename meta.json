@@ -1,0 +1,19 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "cjnj193:icp",
+  "visibility": "private",
+  "url": "https://github.com/JohnN193/ICP-slam-testing",
+  "description": "A SLAM service that builds a point cloud map by accumulating scans from a camera and aligning them with ICP",
+  "models": [
+    {
+      "api": "rdk:service:slam",
+      "model": "cjnj193:icp:icp-slam"
+    }
+  ],
+  "build": {
+    "build": "make module",
+    "arch": ["linux/amd64", "linux/arm64"],
+    "path": "bin/module.tar.gz"
+  },
+  "entrypoint": "bin/icp-slam"
+}
