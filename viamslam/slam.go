@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 
+	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/camera"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
@@ -21,7 +22,9 @@ import (
 )
 
 const (
-	chunkSizeBytes = 1 * 1024 * 1024 // 1MB
+	chunkSizeBytes  = 1 * 1024 * 1024 // 1MB
+	metersToMM      = 1000.0
+	mmToMeters      = 1.0 / metersToMM
 
 	// DoCommand key for adding a new scan to the map.
 	addScanKey = "add_scan"
@@ -129,8 +132,14 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 		return nil, err
 	}
 
+	// PCD files use meters; ICP works in millimeters. Convert here on ingestion.
+	mmPC, err := scalePointCloud(worldPC, metersToMM)
+	if err != nil {
+		return nil, err
+	}
+
 	s.mu.Lock()
-	s.clouds = append(s.clouds, worldPC)
+	s.clouds = append(s.clouds, mmPC)
 	clouds := make([]pointcloud.PointCloud, len(s.clouds))
 	copy(clouds, s.clouds)
 	s.mu.Unlock()
@@ -168,7 +177,12 @@ func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, erro
 
 	var buf bytes.Buffer
 	if cloud != nil {
-		if err := pointcloud.ToPCD(cloud, &buf, pointcloud.PCDBinary); err != nil {
+		// ICP map is in mm; convert back to meters for PCD output.
+		metersCloud, err := scalePointCloud(cloud, mmToMeters)
+		if err != nil {
+			return nil, err
+		}
+		if err := pointcloud.ToPCD(metersCloud, &buf, pointcloud.PCDBinary); err != nil {
 			return nil, err
 		}
 	}
@@ -210,4 +224,19 @@ func (s *ICPSlam) Properties(_ context.Context) (slam.Properties, error) {
 // Close is a no-op.
 func (s *ICPSlam) Close(_ context.Context) error {
 	return nil
+}
+
+// scalePointCloud returns a new point cloud with every coordinate multiplied by factor.
+func scalePointCloud(src pointcloud.PointCloud, factor float64) (pointcloud.PointCloud, error) {
+	dst := pointcloud.NewBasicEmpty()
+	var iterErr error
+	src.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
+		scaled := r3.Vector{X: p.X * factor, Y: p.Y * factor, Z: p.Z * factor}
+		if err := dst.Set(scaled, d); err != nil {
+			iterErr = err
+			return false
+		}
+		return true
+	})
+	return dst, iterErr
 }
