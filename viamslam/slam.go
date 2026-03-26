@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"math"
 	"sync"
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/camera"
+	"go.viam.com/rdk/components/movementsensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
 	"go.viam.com/rdk/referenceframe"
@@ -73,10 +75,16 @@ type ICPSlam struct {
 	clouds   []pointcloud.PointCloud // accumulated world-frame scans
 	mergedPC pointcloud.PointCloud   // latest ICP-aligned map
 
-	camera    camera.Camera
-	fsService framesystem.Service
-	icpConfig icp.ICPConfig
-	logger    logging.Logger
+	camera         camera.Camera
+	movementSensor movementsensor.MovementSensor
+	fsService      framesystem.Service
+	icpConfig      icp.ICPConfig
+	logger         logging.Logger
+
+	originOnce sync.Once
+	originLat  float64
+	originLng  float64
+	originAlt  float64
 }
 
 func newICPSlam(
@@ -100,12 +108,21 @@ func newICPSlam(
 		return nil, err
 	}
 
+	var ms movementsensor.MovementSensor
+	if cfg.MovementSensor != "" {
+		ms, err = movementsensor.FromDependencies(deps, cfg.MovementSensor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	return &ICPSlam{
-		Named:     conf.ResourceName().AsNamed(),
-		camera:    cam,
-		fsService: fs,
-		icpConfig: icp.DefaultICPConfig(),
-		logger:    logger,
+		Named:          conf.ResourceName().AsNamed(),
+		camera:         cam,
+		movementSensor: ms,
+		fsService:      fs,
+		icpConfig:      icp.DefaultICPConfig(),
+		logger:         logger,
 	}, nil
 }
 
@@ -123,13 +140,21 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 		return nil, err
 	}
 
-	// Transform the scan from camera frame into world frame using the frame system.
-	// The frame system uses the robot's configured transforms (including any odometry
-	// supplemental transforms if the robot is set up with a movement sensor).
+	// Transform the scan from camera frame into the frame system's root (base frame).
 	cameraFrame := s.camera.Name().ShortName()
-	worldPC, err := s.fsService.TransformPointCloud(ctx, pc, cameraFrame, referenceframe.World)
+	basePC, err := s.fsService.TransformPointCloud(ctx, pc, cameraFrame, referenceframe.World)
 	if err != nil {
 		return nil, err
+	}
+
+	// If a movement sensor is configured, apply its pose to place the scan
+	// in the global frame. Without this, every scan lands at the base origin.
+	worldPC := basePC
+	if s.movementSensor != nil {
+		worldPC, err = s.applyMovementSensorPose(ctx, basePC)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// PCD files use meters; ICP works in millimeters. Convert here on ingestion.
@@ -140,30 +165,24 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 
 	s.mu.Lock()
 	s.clouds = append(s.clouds, mmPC)
-	clouds := make([]pointcloud.PointCloud, len(s.clouds))
-	copy(clouds, s.clouds)
-	s.mu.Unlock()
+	numScans := len(s.clouds)
 
-	// Run ICP alignment once we have at least two scans.
-	if len(clouds) >= 2 {
-		merged, err := icp.AlignPointClouds(ctx, clouds, s.icpConfig, s.logger)
+	// Merge the new scan into the existing map (no ICP alignment).
+	if s.mergedPC == nil {
+		s.mergedPC = mmPC
+	} else {
+		merged, err := icp.NaiveMergeClouds(ctx, s.mergedPC, mmPC, s.logger)
 		if err != nil {
+			s.mu.Unlock()
 			return nil, err
 		}
-		s.mu.Lock()
 		s.mergedPC = merged
-		s.mu.Unlock()
 	}
-
-	s.mu.RLock()
-	size := 0
-	if s.mergedPC != nil {
-		size = s.mergedPC.Size()
-	}
-	s.mu.RUnlock()
+	size := s.mergedPC.Size()
+	s.mu.Unlock()
 
 	return map[string]interface{}{
-		"scans_accumulated": len(clouds),
+		"scans_accumulated": numScans,
 		"map_points":        size,
 	}, nil
 }
@@ -224,6 +243,53 @@ func (s *ICPSlam) Properties(_ context.Context) (slam.Properties, error) {
 // Close is a no-op.
 func (s *ICPSlam) Close(_ context.Context) error {
 	return nil
+}
+
+// applyMovementSensorPose gets the current position and orientation from the movement
+// sensor and transforms the point cloud from the base frame into the global frame.
+// The first call records the origin; subsequent calls compute a local offset from it.
+func (s *ICPSlam) applyMovementSensorPose(ctx context.Context, pc pointcloud.PointCloud) (pointcloud.PointCloud, error) {
+	geoPoint, alt, err := s.movementSensor.Position(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	orientation, err := s.movementSensor.Orientation(ctx, nil)
+	if err != nil {
+		s.logger.Warnf("movement sensor orientation unavailable, using identity: %v", err)
+		orientation = spatialmath.NewZeroPose().Orientation()
+	}
+
+	// Record the first position as origin.
+	s.originOnce.Do(func() {
+		s.originLat = geoPoint.Lat()
+		s.originLng = geoPoint.Lng()
+		s.originAlt = alt
+	})
+
+	// Convert geo coordinates to local meter offsets from origin.
+	latRad := s.originLat * math.Pi / 180.0
+	dx := (geoPoint.Lng() - s.originLng) * math.Cos(latRad) * 111319.5
+	dy := (geoPoint.Lat() - s.originLat) * 111319.5
+	dz := alt - s.originAlt
+
+	pose := spatialmath.NewPose(r3.Vector{X: dx, Y: dy, Z: dz}, orientation)
+	return transformPointCloud(pc, pose)
+}
+
+// transformPointCloud applies a pose transform to every point in the cloud.
+func transformPointCloud(src pointcloud.PointCloud, pose spatialmath.Pose) (pointcloud.PointCloud, error) {
+	dst := pointcloud.NewBasicEmpty()
+	var iterErr error
+	src.Iterate(0, 0, func(p r3.Vector, d pointcloud.Data) bool {
+		transformed := spatialmath.Compose(pose, spatialmath.NewPoseFromPoint(p)).Point()
+		if err := dst.Set(transformed, d); err != nil {
+			iterErr = err
+			return false
+		}
+		return true
+	})
+	return dst, iterErr
 }
 
 // scalePointCloud returns a new point cloud with every coordinate multiplied by factor.
