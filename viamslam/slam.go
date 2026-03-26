@@ -22,8 +22,6 @@ import (
 
 const (
 	chunkSizeBytes = 1 * 1024 * 1024 // 1MB
-	metersToMM     = 1000.0
-	mmToMeters     = 1.0 / metersToMM
 
 	// DoCommand key for adding a new scan to the map.
 	addScanKey = "add_scan"
@@ -69,9 +67,10 @@ type ICPSlam struct {
 	resource.Named
 	resource.AlwaysRebuild
 
-	mu       sync.RWMutex
-	clouds   []pointcloud.PointCloud // accumulated world-frame scans
-	mergedPC pointcloud.PointCloud   // latest merged map
+	mu        sync.RWMutex
+	clouds    []pointcloud.PointCloud // accumulated world-frame scans
+	mergedPC  pointcloud.PointCloud   // latest merged map
+	lastPose  spatialmath.Pose        // last pose recorded from the movement sensor
 
 	camera         camera.Camera
 	movementSensor movementsensor.MovementSensor // optional; nil if not configured
@@ -146,27 +145,26 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 			return nil, err
 		}
 		worldPC = dst
-		s.logger.Infof("add_scan: sensor pose — translation: (%.4f, %.4f, %.4f) m, orientation: %v",
-			pose.Point().X, pose.Point().Y, pose.Point().Z, pose.Orientation().OrientationVectorDegrees())
-	}
-
-	// PCD files use meters; ICP works in millimeters. Convert here on ingestion.
-	mmPC, err := scalePointCloud(worldPC, metersToMM)
-	if err != nil {
-		return nil, err
+		ov := pose.Orientation().OrientationVectorDegrees()
+		pt := pose.Point()
+		s.logger.Infof("add_scan: sensor pose — x: %.4f y: %.4f z: %.4f ox: %.4f oy: %.4f oz: %.4f th: %.4f",
+			pt.X, pt.Y, pt.Z, ov.OX, ov.OY, ov.OZ, ov.Theta)
+		s.mu.Lock()
+		s.lastPose = pose
+		s.mu.Unlock()
 	}
 
 	s.mu.Lock()
-	s.clouds = append(s.clouds, mmPC)
+	s.clouds = append(s.clouds, worldPC)
 	// Always keep the latest scan visible in PointCloudMap, even before alignment runs.
 	if s.mergedPC == nil {
-		s.mergedPC = mmPC
+		s.mergedPC = worldPC
 	}
 	clouds := make([]pointcloud.PointCloud, len(s.clouds))
 	copy(clouds, s.clouds)
 	s.mu.Unlock()
 
-	s.logger.Infof("add_scan: %d scans accumulated (%d points in latest scan)", len(clouds), mmPC.Size())
+	s.logger.Infof("add_scan: %d scans accumulated (%d points in latest scan)", len(clouds), worldPC.Size())
 
 	resp := map[string]interface{}{
 		"scans_accumulated": len(clouds),
@@ -221,7 +219,7 @@ func sensorPose(ctx context.Context, ms movementsensor.MovementSensor) (spatialm
 	if err != nil {
 		return nil, err
 	}
-	// Wheeled odometry returns local XY as Lat=Y, Lng=X (in meters).
+	// Wheeled odometry returns local XY as Lat=Y, Lng=X (in millimeters).
 	translation := r3.Vector{X: pos.Lng(), Y: pos.Lat(), Z: alt}
 	return spatialmath.NewPose(translation, orient), nil
 }
@@ -237,13 +235,9 @@ func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, erro
 		cloud = pointcloud.NewBasicEmpty()
 	}
 
-	// ICP map is in mm; convert back to meters for PCD output.
-	metersCloud, err := scalePointCloud(cloud, mmToMeters)
-	if err != nil {
-		return nil, err
-	}
+	// pointcloud.ToPCD handles the mm→meters conversion internally.
 	var buf bytes.Buffer
-	if err := pointcloud.ToPCD(metersCloud, &buf, pointcloud.PCDBinary); err != nil {
+	if err := pointcloud.ToPCD(cloud, &buf, pointcloud.PCDBinary); err != nil {
 		return nil, err
 	}
 
@@ -257,9 +251,15 @@ func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, erro
 	}, nil
 }
 
-// Position returns a zero pose — localization is not implemented.
+// Position returns the last pose recorded from the movement sensor, or a zero
+// pose if no scan has been added yet.
 func (s *ICPSlam) Position(_ context.Context) (spatialmath.Pose, error) {
-	return spatialmath.NewZeroPose(), nil
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.lastPose == nil {
+		return spatialmath.NewZeroPose(), nil
+	}
+	return s.lastPose, nil
 }
 
 // InternalState returns an empty stream.
