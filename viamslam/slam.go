@@ -140,32 +140,42 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 
 	s.mu.Lock()
 	s.clouds = append(s.clouds, mmPC)
+	// Always keep the latest scan visible in PointCloudMap, even before ICP runs.
+	if s.mergedPC == nil {
+		s.mergedPC = mmPC
+	}
 	clouds := make([]pointcloud.PointCloud, len(s.clouds))
 	copy(clouds, s.clouds)
 	s.mu.Unlock()
 
+	s.logger.Infof("add_scan: %d scans accumulated (%d points in latest scan)", len(clouds), mmPC.Size())
+
+	resp := map[string]interface{}{
+		"scans_accumulated": len(clouds),
+	}
+
 	// Run ICP alignment once we have at least two scans.
 	if len(clouds) >= 2 {
+		s.logger.Infof("add_scan: running ICP alignment across %d scans", len(clouds))
 		merged, err := icp.AlignPointClouds(ctx, clouds, s.icpConfig, s.logger)
 		if err != nil {
-			return nil, err
+			// Log the failure but don't return it — the scan is already accumulated
+			// and ICP will retry on the next add_scan call.
+			s.logger.Errorw("add_scan: ICP alignment failed", "error", err, "num_scans", len(clouds))
+			resp["icp_error"] = err.Error()
+		} else {
+			s.mu.Lock()
+			s.mergedPC = merged
+			s.mu.Unlock()
+			s.logger.Infof("add_scan: ICP succeeded, merged map has %d points", merged.Size())
 		}
-		s.mu.Lock()
-		s.mergedPC = merged
-		s.mu.Unlock()
 	}
 
 	s.mu.RLock()
-	size := 0
-	if s.mergedPC != nil {
-		size = s.mergedPC.Size()
-	}
+	resp["map_points"] = s.mergedPC.Size()
 	s.mu.RUnlock()
 
-	return map[string]interface{}{
-		"scans_accumulated": len(clouds),
-		"map_points":        size,
-	}, nil
+	return resp, nil
 }
 
 // PointCloudMap serializes the current merged map to PCD binary format and returns
