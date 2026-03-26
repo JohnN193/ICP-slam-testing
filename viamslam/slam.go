@@ -10,11 +10,10 @@ import (
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/camera"
+	"go.viam.com/rdk/components/movementsensor"
 	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/pointcloud"
-	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
-	"go.viam.com/rdk/robot/framesystem"
 	"go.viam.com/rdk/services/slam"
 	"go.viam.com/rdk/spatialmath"
 
@@ -28,6 +27,9 @@ const (
 
 	// DoCommand key for adding a new scan to the map.
 	addScanKey = "add_scan"
+
+	// Key used with wheeled odometry's Position() to get local XY in meters.
+	returnRelativePosKey = "return_relative_pos_m"
 )
 
 // Model is the resource model triplet for this SLAM service.
@@ -47,6 +49,7 @@ func init() {
 type Config struct {
 	Camera         string `json:"camera"`
 	MovementSensor string `json:"movement_sensor,omitempty"`
+	UseICP         *bool  `json:"use_icp,omitempty"`
 }
 
 // Validate returns the list of dependencies this service requires.
@@ -54,10 +57,7 @@ func (c *Config) Validate(path string) ([]string, []string, error) {
 	if c.Camera == "" {
 		return nil, nil, resource.NewConfigValidationFieldRequiredError(path, "camera")
 	}
-	deps := []string{
-		c.Camera,
-		framesystem.PublicServiceName.String(),
-	}
+	deps := []string{c.Camera}
 	if c.MovementSensor != "" {
 		deps = append(deps, c.MovementSensor)
 	}
@@ -71,12 +71,13 @@ type ICPSlam struct {
 
 	mu       sync.RWMutex
 	clouds   []pointcloud.PointCloud // accumulated world-frame scans
-	mergedPC pointcloud.PointCloud   // latest ICP-aligned map
+	mergedPC pointcloud.PointCloud   // latest merged map
 
-	camera    camera.Camera
-	fsService framesystem.Service
-	icpConfig icp.ICPConfig
-	logger    logging.Logger
+	camera         camera.Camera
+	movementSensor movementsensor.MovementSensor // optional; nil if not configured
+	icpConfig      icp.ICPConfig
+	useICP         bool
+	logger         logging.Logger
 }
 
 func newICPSlam(
@@ -95,41 +96,58 @@ func newICPSlam(
 		return nil, err
 	}
 
-	fs, err := framesystem.FromDependencies(deps)
-	if err != nil {
-		return nil, err
+	var ms movementsensor.MovementSensor
+	if cfg.MovementSensor != "" {
+		ms, err = movementsensor.FromDependencies(deps, cfg.MovementSensor)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	useICP := true
+	if cfg.UseICP != nil {
+		useICP = *cfg.UseICP
 	}
 
 	return &ICPSlam{
-		Named:     conf.ResourceName().AsNamed(),
-		camera:    cam,
-		fsService: fs,
-		icpConfig: icp.DefaultICPConfig(),
-		logger:    logger,
+		Named:          conf.ResourceName().AsNamed(),
+		camera:         cam,
+		movementSensor: ms,
+		icpConfig:      icp.DefaultICPConfig(),
+		useICP:         useICP,
+		logger:         logger,
 	}, nil
 }
 
 // DoCommand handles the "add_scan" command, which pulls the current point cloud
-// from the camera, transforms it into the world frame via the frame system,
-// adds it to the accumulated scans, and re-runs ICP alignment.
+// from the camera, optionally transforms it into the world frame via the movement
+// sensor pose, adds it to the accumulated scans, and re-runs alignment.
 func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if _, ok := cmd[addScanKey]; !ok {
 		return map[string]interface{}{}, nil
 	}
 
-	// Pull the current scan from the camera (in camera frame).
+	// Pull the current scan from the camera (in camera frame, meters).
 	pc, err := s.camera.NextPointCloud(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	// Transform the scan from camera frame into world frame using the frame system.
-	// The frame system uses the robot's configured transforms (including any odometry
-	// supplemental transforms if the robot is set up with a movement sensor).
-	cameraFrame := s.camera.Name().ShortName()
-	worldPC, err := s.fsService.TransformPointCloud(ctx, pc, cameraFrame, referenceframe.World)
-	if err != nil {
-		return nil, err
+	// If a movement sensor is configured, transform the scan into world frame
+	// using the sensor's current pose.
+	worldPC := pc
+	if s.movementSensor != nil {
+		pose, err := sensorPose(ctx, s.movementSensor)
+		if err != nil {
+			return nil, err
+		}
+		dst := pointcloud.NewBasicEmpty()
+		if err := pointcloud.ApplyOffset(pc, pose, dst); err != nil {
+			return nil, err
+		}
+		worldPC = dst
+		s.logger.Infof("add_scan: sensor pose — translation: (%.4f, %.4f, %.4f) m, orientation: %v",
+			pose.Point().X, pose.Point().Y, pose.Point().Z, pose.Orientation().OrientationVectorDegrees())
 	}
 
 	// PCD files use meters; ICP works in millimeters. Convert here on ingestion.
@@ -140,7 +158,7 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 
 	s.mu.Lock()
 	s.clouds = append(s.clouds, mmPC)
-	// Always keep the latest scan visible in PointCloudMap, even before ICP runs.
+	// Always keep the latest scan visible in PointCloudMap, even before alignment runs.
 	if s.mergedPC == nil {
 		s.mergedPC = mmPC
 	}
@@ -154,28 +172,58 @@ func (s *ICPSlam) DoCommand(ctx context.Context, cmd map[string]interface{}) (ma
 		"scans_accumulated": len(clouds),
 	}
 
-	// Run ICP alignment once we have at least two scans.
+	// Merge or align scans once we have at least two.
 	if len(clouds) >= 2 {
-		s.logger.Infof("add_scan: running ICP alignment across %d scans", len(clouds))
-		merged, err := icp.AlignPointClouds(ctx, clouds, s.icpConfig, s.logger)
-		if err != nil {
-			// Log the failure but don't return it — the scan is already accumulated
-			// and ICP will retry on the next add_scan call.
-			s.logger.Errorw("add_scan: ICP alignment failed", "error", err, "num_scans", len(clouds))
-			resp["icp_error"] = err.Error()
+		var merged pointcloud.PointCloud
+		var mergeErr error
+		if s.useICP {
+			s.logger.Infof("add_scan: running ICP alignment across %d scans", len(clouds))
+			merged, mergeErr = icp.AlignPointClouds(ctx, clouds, s.icpConfig, s.logger)
+		} else {
+			s.logger.Infof("add_scan: naive merge across %d scans (ICP disabled)", len(clouds))
+			merged = clouds[0]
+			for _, c := range clouds[1:] {
+				merged, mergeErr = icp.NaiveMergeClouds(ctx, merged, c, s.logger)
+				if mergeErr != nil {
+					break
+				}
+			}
+		}
+		if mergeErr != nil {
+			s.logger.Errorw("add_scan: merge failed", "error", mergeErr, "num_scans", len(clouds))
+			resp["merge_error"] = mergeErr.Error()
 		} else {
 			s.mu.Lock()
 			s.mergedPC = merged
 			s.mu.Unlock()
-			s.logger.Infof("add_scan: ICP succeeded, merged map has %d points", merged.Size())
+			s.logger.Infof("add_scan: merge succeeded, map has %d points", merged.Size())
 		}
 	}
 
 	s.mu.RLock()
-	resp["map_points"] = s.mergedPC.Size()
+	if s.mergedPC != nil {
+		resp["map_points"] = s.mergedPC.Size()
+	}
 	s.mu.RUnlock()
 
 	return resp, nil
+}
+
+// sensorPose reads the current position and orientation from a movement sensor
+// and returns them as a spatialmath.Pose. Position is read in local meters
+// (return_relative_pos_m) so the pose is relative to the sensor's origin.
+func sensorPose(ctx context.Context, ms movementsensor.MovementSensor) (spatialmath.Pose, error) {
+	pos, alt, err := ms.Position(ctx, map[string]interface{}{returnRelativePosKey: true})
+	if err != nil {
+		return nil, err
+	}
+	orient, err := ms.Orientation(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Wheeled odometry returns local XY as Lat=Y, Lng=X (in meters).
+	translation := r3.Vector{X: pos.Lng(), Y: pos.Lat(), Z: alt}
+	return spatialmath.NewPose(translation, orient), nil
 }
 
 // PointCloudMap serializes the current merged map to PCD binary format and returns
@@ -185,16 +233,18 @@ func (s *ICPSlam) PointCloudMap(_ context.Context, _ bool) (func() ([]byte, erro
 	cloud := s.mergedPC
 	s.mu.RUnlock()
 
+	if cloud == nil {
+		cloud = pointcloud.NewBasicEmpty()
+	}
+
+	// ICP map is in mm; convert back to meters for PCD output.
+	metersCloud, err := scalePointCloud(cloud, mmToMeters)
+	if err != nil {
+		return nil, err
+	}
 	var buf bytes.Buffer
-	if cloud != nil {
-		// ICP map is in mm; convert back to meters for PCD output.
-		metersCloud, err := scalePointCloud(cloud, mmToMeters)
-		if err != nil {
-			return nil, err
-		}
-		if err := pointcloud.ToPCD(metersCloud, &buf, pointcloud.PCDBinary); err != nil {
-			return nil, err
-		}
+	if err := pointcloud.ToPCD(metersCloud, &buf, pointcloud.PCDBinary); err != nil {
+		return nil, err
 	}
 
 	data := buf.Bytes()

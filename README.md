@@ -27,10 +27,11 @@ Add the following to your robot config:
 
 ### Attributes
 
-| Name              | Type   | Required | Description                                                     |
-|-------------------|--------|----------|-----------------------------------------------------------------|
-| `camera`          | string | Yes      | Name of the depth camera component to pull point clouds from    |
-| `movement_sensor` | string | No       | Name of a movement sensor / odometry source (future use)        |
+| Name              | Type   | Required | Default | Description                                                                    |
+|-------------------|--------|----------|---------|--------------------------------------------------------------------------------|
+| `camera`          | string | Yes      | —       | Name of the depth camera component to pull point clouds from                   |
+| `movement_sensor` | string | No       | —       | Name of a movement sensor / odometry source (future use)                       |
+| `use_icp`         | bool   | No       | `true`  | Set to `false` to skip ICP and instead do a naive concatenation of world-frame scans |
 
 ## DoCommands
 
